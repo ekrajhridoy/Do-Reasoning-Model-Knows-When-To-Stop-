@@ -12,11 +12,13 @@ from google.genai import types
 
 # ---------------- CONFIG ----------------
 MODEL = "gemini-2.5-flash"
-CSV_FILE = "gsm8k_train.csv"        # your English data
+CSV_FILE = "gsm8k train.csv"        # your English data
 OUTPUT_FILE = "train_bn.csv"        # translated output
 QUESTION_COL = "question"           # column names in your input CSV
 ANSWER_COL = "answer"
-KEYS_FILE = "api_keys.txt"          # or set env var GEMINI_API_KEYS=key1,key2,...
+API_KEYS = ["AQ.Ab8RN6L1a69ld-c83_RNTPCx392taOLKgMlG90YChMRWg7cy6g", "AQ.Ab8RN6ID6Uj0OAJgfaudOvU0koaGfio5TKEUsbDNQRYbPZWTLw",
+             "AQ.Ab8RN6IsfVtRnLSZ7Q0LB-9PJ9V7Q-r3BQbCjctFjHRK07FMgA","AQ.Ab8RN6L2jfgR5HMo7ijm2G9ga6uG34LTpK-go9Ao8-IDdNjh4A",
+             "AQ.Ab8RN6IMKbWps--v8jgwS9yLUFGJ344YX_8ObKKlok_fW7qP0Q","AQ.Ab8RN6K_K7wX_p5l0FiOtM9MS-SNb7zKVViP4SYyDgbBYxYX2Q"]          # or set env var GEMINI_API_KEYS=key1,key2,...
 WORKERS = 4
 RATE_LIMIT_COOLDOWN = 60
 MAX_OTHER_RETRIES = 6
