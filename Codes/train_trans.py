@@ -1,31 +1,37 @@
+"""
+Translate GSM8K train (English) -> Bangla using TranslateGemma 4b via Ollama.
+
+Install:  pip install requests tqdm
+Run:      python translate_gsm8k_bn.py
+
+Output:   train_bn.csv  (columns: question_bn, answer_bn)
+Resumable: if you stop the script, run it again and it continues where it left off.
+"""
+
 import csv
-import json
+import os
 import re
-import time
-import random
-import threading
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from google import genai
-from google.genai import types
+import requests
+from tqdm import tqdm
 
-# ---------------- CONFIG ----------------
-API_KEYS = ["AQ.Ab8RN6L1a69ld-c83_RNTPCx392taOLKgMlG90YChMRWg7cy6g", "AQ.Ab8RN6ID6Uj0OAJgfaudOvU0koaGfio5TKEUsbDNQRYbPZWTLw",
-             "AQ.Ab8RN6IsfVtRnLSZ7Q0LB-9PJ9V7Q-r3BQbCjctFjHRK07FMgA","AQ.Ab8RN6L2jfgR5HMo7ijm2G9ga6uG34LTpK-go9Ao8-IDdNjh4A",
-             "AQ.Ab8RN6IMKbWps--v8jgwS9yLUFGJ344YX_8ObKKlok_fW7qP0Q","AQ.Ab8RN6K_K7wX_p5l0FiOtM9MS-SNb7zKVViP4SYyDgbBYxYX2Q"] # or set env var GEMINI_API_KEYS=key1,key2,...
+# =============================================================================
+#  SETTINGS  <-- change these
+# =============================================================================
+INPUT_CSV = "C:\\Users\\EKRAJ\\OneDrive\\Documents\\GitHub\\Do-Reasoning-Model-Knows-When-To-Stop-\\data\\gsm8k train.csv"   # <-- PUT YOUR ENGLISH train.csv PATH HERE
+OUTPUT_CSV = "train_bn.csv"                 # translated file (saved next to this script)
+ISSUES_LOG = "translation_issues.txt"       # row numbers whose numbers didn't validate
 
-MODEL = "gemini-2.5-flash"
-BASE_DIR = Path(__file__).resolve().parent
-CSV_FILE = BASE_DIR / "C:\\Users\\EKRAJ\\OneDrive\\Documents\\GitHub\\Do-Reasoning-Model-Knows-When-To-Stop-\\data\\gsm8k train.csv"   # your English data
-OUTPUT_FILE = BASE_DIR / "gsm8k_train_bn.csv"   # translated output
-QUESTION_COL = "question"                 # column names in your input CSV
-ANSWER_COL = "answer"
-WORKERS = 4
-RATE_LIMIT_COOLDOWN = 60
-MAX_OTHER_RETRIES = 6
+QUESTION_COLUMN = "question"                # column names in your input CSV
+ANSWER_COLUMN = "answer"
 
-OUTPUT_COLUMNS = ["idx", QUESTION_COL, ANSWER_COL, "question_bn", "answer_bn"]
+MODEL = "translategemma:4b"                 # check the exact name with: ollama list
+OLLAMA_URL = "http://localhost:11434/api/chat"
+
+LIMIT = None                                # None = all rows, or e.g. 20 for a quick test
+MAX_RETRIES = 3                             # retries if a translation fails validation
+# =============================================================================
+
 
 PROMPT = """You are a professional translator. Translate the following math word problem and its step-by-step solution from English into natural, fluent Bangla (Bengali script).
 
@@ -35,189 +41,131 @@ Rules:
 - Keep math expressions, operators, and calculator annotations inside << >> with the same structure (only the digits change to Bangla digits).
 - Keep the final line "#### <number>" with the same number, written in Bangla digits.
 - Keep line breaks in the answer the same as the original.
-- Translate only the natural-language text.
+- Translate only the natural-language text."""
 
-Return ONLY a JSON object with keys "question" and "answer", with the Bangla translations as string values.
-
-Input:
+# Tells the model how to format its reply so we can split question and answer.
+FORMAT_INSTRUCTION = """
+Output format (exactly, no extra commentary):
+### QUESTION
+<translated question>
+### ANSWER
+<translated solution>
 """
 
-EN_TO_BN = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
-BN_TO_EN = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
 
-
-def to_bn_digits(text):
-    return text.translate(EN_TO_BN)
-
-
-def to_en_digits(text):
-    return text.translate(BN_TO_EN)
-
-
-def final_number(text):
-    m = re.search(r"####\s*(\S+)", text)
-    return m.group(1) if m else None
-
-
-# ---------------- KEY POOL ----------------
-class KeyPool:
-    """Round-robin over API keys; keys that hit rate limits rest for a while."""
-
-    def __init__(self, keys):
-        self.keys = keys
-        self.clients = {k: genai.Client(api_key=k) for k in keys}
-        self.cooldown_until = {k: 0.0 for k in keys}
-        self.lock = threading.Lock()
-        self.idx = 0
-
-    def get(self):
-        while True:
-            with self.lock:
-                now = time.time()
-                n = len(self.keys)
-                for _ in range(n):
-                    key = self.keys[self.idx % n]
-                    self.idx += 1
-                    if self.cooldown_until[key] <= now:
-                        return key
-                wait = min(self.cooldown_until.values()) - now
-            time.sleep(max(wait, 1))
-
-    def penalize(self, key, seconds):
-        with self.lock:
-            self.cooldown_until[key] = time.time() + seconds
-
-
-def load_keys():
-    keys = [k.strip() for k in API_KEYS if k.strip() and "key1" not in k and "key2" not in k and "key3" not in k]
-    if not keys:
-        raise SystemExit("No valid API keys. Replace the placeholders in API_KEYS with your Gemini keys.")
-    keys = list(dict.fromkeys(keys))
-    print(f"Loaded {len(keys)} API key(s).")
-    return keys
-
-
-# ---------------- TRANSLATION ----------------
-def translate_item(pool, item):
-    payload = json.dumps(
-        {"question": item[QUESTION_COL], "answer": item[ANSWER_COL]},
-        ensure_ascii=False,
+# ---------- Step 1: ask the model to translate one example -------------------
+def translate_once(question, answer):
+    message = f"{PROMPT}\n{FORMAT_INSTRUCTION}\n### QUESTION\n{question}\n### ANSWER\n{answer}"
+    response = requests.post(
+        OLLAMA_URL,
+        json={
+            "model": MODEL,
+            "messages": [{"role": "user", "content": message}],
+            "stream": False,
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 1536},
+        },
+        timeout=300,
     )
-    prompt = PROMPT + payload
-    other_errors = 0
+    response.raise_for_status()
+    text = response.json()["message"]["content"].strip()
 
-    while True:
-        key = pool.get()
+    # split the reply into question and answer
+    match = re.search(r"###\s*QUESTION\s*\n(.*?)\n\s*###\s*ANSWER\s*\n(.*)", text, re.S)
+    if not match:
+        return None
+    return match.group(1).strip(), match.group(2).strip()
+
+
+# ---------- Step 2: check the numbers were preserved -------------------------
+BANGLA_TO_ENGLISH = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+
+
+def get_numbers(text):
+    text = text.translate(BANGLA_TO_ENGLISH).replace(",", "")
+    return re.findall(r"\d+(?:\.\d+)?", text)
+
+
+def is_valid(q_en, a_en, q_bn, a_bn):
+    # final "#### number" line must exist and match
+    final_en = re.search(r"####\s*(.+)\s*$", a_en)
+    final_bn = re.search(r"####\s*(.+)\s*$", a_bn)
+    if not final_en or not final_bn:
+        return False
+    if get_numbers(final_en.group(1)) != get_numbers(final_bn.group(1)):
+        return False
+    if re.search(r"[0-9]", final_bn.group(1)):      # must use Bangla digits
+        return False
+    # all numbers must be the same, in the same order
+    if get_numbers(q_en) != get_numbers(q_bn):
+        return False
+    if get_numbers(a_en) != get_numbers(a_bn):
+        return False
+    # calculator annotations << >> must be kept
+    if a_en.count("<<") != a_bn.count("<<") or a_en.count(">>") != a_bn.count(">>"):
+        return False
+    return True
+
+
+# ---------- Step 3: translate with retries -----------------------------------
+def translate(question, answer):
+    """Returns (question_bn, answer_bn, passed_validation)."""
+    best = ("", "", False)
+    for _ in range(MAX_RETRIES):
         try:
-            resp = pool.clients[key].models.generate_content(
-                model=MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.2,
-                ),
-            )
-            data = json.loads(resp.text)
-            q_bn = to_bn_digits(data["question"].strip())
-            a_bn = to_bn_digits(data["answer"].strip())
-
-            if not q_bn or "####" not in a_bn:
-                raise ValueError("Malformed translation")
-
-            if to_en_digits(final_number(a_bn) or "") != final_number(item[ANSWER_COL]):
-                raise ValueError("Final answer mismatch")
-
-            return q_bn, a_bn
-
-        except Exception as e:
-            msg = str(e)
-            low = msg.lower()
-            if "429" in msg or "resource_exhausted" in low or "quota" in low:
-                pool.penalize(key, RATE_LIMIT_COOLDOWN)
-            elif "api_key_invalid" in low or "permission_denied" in low or "403" in msg:
-                print(f"[!] Key ...{key[-6:]} looks invalid, disabling it.")
-                pool.penalize(key, 10**9)
-            else:
-                other_errors += 1
-                if other_errors > MAX_OTHER_RETRIES:
-                    print(f"[x] Giving up on item after retries: {msg[:120]}")
-                    return None, None
-                time.sleep(min(2 ** other_errors, 30) + random.random())
+            result = translate_once(question, answer)
+        except requests.RequestException as error:
+            print(f"\n[warning] Ollama request failed: {error}")
+            continue
+        if result is None:
+            continue
+        q_bn, a_bn = result
+        if is_valid(question, answer, q_bn, a_bn):
+            return q_bn, a_bn, True
+        if not best[0]:
+            best = (q_bn, a_bn, False)      # keep first attempt as fallback
+    return best
 
 
-# ---------------- DATA & RESUME ----------------
-def load_csv_rows():
-    if not CSV_FILE.exists():
-        raise SystemExit(f"CSV not found: {CSV_FILE}")
-    with open(CSV_FILE, encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        missing = {QUESTION_COL, ANSWER_COL} - set(reader.fieldnames or [])
-        if missing:
-            raise SystemExit(f"Missing column(s) in CSV: {missing}. Found: {reader.fieldnames}")
-        return list(reader)
+# ---------- Step 4: main loop ------------------------------------------------
+def count_rows_done():
+    """How many rows are already saved in the output CSV (for resuming)."""
+    if not os.path.exists(OUTPUT_CSV):
+        return 0
+    with open(OUTPUT_CSV, newline="", encoding="utf-8-sig") as f:
+        return max(sum(1 for _ in csv.reader(f)) - 1, 0)   # minus header row
 
 
-def load_done_ids():
-    done = set()
-    if OUTPUT_FILE.exists():
-        with open(OUTPUT_FILE, encoding="utf-8-sig", newline="") as f:
-            for row in csv.DictReader(f):
-                try:
-                    done.add(int(row["idx"]))
-                except (KeyError, TypeError, ValueError):
-                    pass
-    return done
-
-
-def ensure_output_header():
-    if not OUTPUT_FILE.exists() or OUTPUT_FILE.stat().st_size == 0:
-        with open(OUTPUT_FILE, "w", encoding="utf-8-sig", newline="") as f:
-            csv.writer(f).writerow(OUTPUT_COLUMNS)
-
-
-# ---------------- MAIN ----------------
 def main():
-    keys = load_keys()
-    pool = KeyPool(keys)
-    data = load_csv_rows()
-    ensure_output_header()
-    done = load_done_ids()
-    todo = [(i, row) for i, row in enumerate(data) if i not in done]
-    print(f"Total: {len(data)} | Already done: {len(done)} | Remaining: {len(todo)}")
+    # read the English dataset
+    with open(INPUT_CSV, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    if LIMIT:
+        rows = rows[:LIMIT]
 
-    write_lock = threading.Lock()
-    failed = []
+    start = count_rows_done()
+    print(f"{len(rows)} rows total, {start} already translated.")
 
-    def work(idx, row):
-        q_bn, a_bn = translate_item(pool, row)
-        if q_bn is None:
-            return idx, False
-        with write_lock:
-            with open(OUTPUT_FILE, "a", encoding="utf-8-sig", newline="") as f:
-                csv.writer(f).writerow([
-                    idx,
-                    row[QUESTION_COL],
-                    row[ANSWER_COL],
-                    q_bn,
-                    a_bn,
-                ])
-                f.flush()
-        return idx, True
+    mode = "a" if start > 0 else "w"
+    with open(OUTPUT_CSV, mode, newline="", encoding="utf-8-sig") as out, \
+         open(ISSUES_LOG, "a", encoding="utf-8") as log:
 
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futures = [ex.submit(work, i, row) for i, row in todo]
-        completed = 0
-        for fut in as_completed(futures):
-            idx, ok = fut.result()
-            completed += 1
+        writer = csv.writer(out)
+        if start == 0:
+            writer.writerow(["question_bn", "answer_bn"])
+
+        for i in tqdm(range(start, len(rows)), initial=start, total=len(rows)):
+            question = rows[i][QUESTION_COLUMN]
+            answer = rows[i][ANSWER_COLUMN]
+
+            q_bn, a_bn, ok = translate(question, answer)
+
+            writer.writerow([q_bn, a_bn])
+            out.flush()                      # saved right away, safe to Ctrl+C
             if not ok:
-                failed.append(idx)
-            if completed % 50 == 0 or completed == len(futures):
-                print(f"Progress: {completed}/{len(futures)}")
+                log.write(f"{i}\n")
+                log.flush()
 
-    print(f"\nFinished. Output: {OUTPUT_FILE}")
-    if failed:
-        print(f"Failed items (re-run script to retry them): {failed}")
+    print(f"Done! Saved to {OUTPUT_CSV}")
 
 
 if __name__ == "__main__":
