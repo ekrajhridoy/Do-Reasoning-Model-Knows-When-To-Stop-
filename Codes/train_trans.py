@@ -1,24 +1,26 @@
-import os
-import sys
 import csv
+import json
 import re
 import time
 import random
 import threading
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from google import genai
 from google.genai import types
 
 # ---------------- CONFIG ----------------
-MODEL = "gemini-2.5-flash"
-CSV_FILE = "gsm8k train.csv"        # your English data
-OUTPUT_FILE = "train_bn.csv"        # translated output
-QUESTION_COL = "question"           # column names in your input CSV
-ANSWER_COL = "answer"
 API_KEYS = ["AQ.Ab8RN6L1a69ld-c83_RNTPCx392taOLKgMlG90YChMRWg7cy6g", "AQ.Ab8RN6ID6Uj0OAJgfaudOvU0koaGfio5TKEUsbDNQRYbPZWTLw",
              "AQ.Ab8RN6IsfVtRnLSZ7Q0LB-9PJ9V7Q-r3BQbCjctFjHRK07FMgA","AQ.Ab8RN6L2jfgR5HMo7ijm2G9ga6uG34LTpK-go9Ao8-IDdNjh4A",
-             "AQ.Ab8RN6IMKbWps--v8jgwS9yLUFGJ344YX_8ObKKlok_fW7qP0Q","AQ.Ab8RN6K_K7wX_p5l0FiOtM9MS-SNb7zKVViP4SYyDgbBYxYX2Q"]          # or set env var GEMINI_API_KEYS=key1,key2,...
+             "AQ.Ab8RN6IMKbWps--v8jgwS9yLUFGJ344YX_8ObKKlok_fW7qP0Q","AQ.Ab8RN6K_K7wX_p5l0FiOtM9MS-SNb7zKVViP4SYyDgbBYxYX2Q"] # or set env var GEMINI_API_KEYS=key1,key2,...
+
+MODEL = "gemini-2.5-flash"
+BASE_DIR = Path(__file__).resolve().parent
+CSV_FILE = BASE_DIR / "C:\\Users\\EKRAJ\\OneDrive\\Documents\\GitHub\\Do-Reasoning-Model-Knows-When-To-Stop-\\data\\gsm8k train.csv"   # your English data
+OUTPUT_FILE = BASE_DIR / "gsm8k_train_bn.csv"   # translated output
+QUESTION_COL = "question"                 # column names in your input CSV
+ANSWER_COL = "answer"
 WORKERS = 4
 RATE_LIMIT_COOLDOWN = 60
 MAX_OTHER_RETRIES = 6
@@ -87,23 +89,16 @@ class KeyPool:
 
 
 def load_keys():
-    env = os.getenv("GEMINI_API_KEYS")
-    if env:
-        keys = [k.strip() for k in env.split(",") if k.strip()]
-    elif os.path.exists(KEYS_FILE):
-        with open(KEYS_FILE) as f:
-            keys = [line.strip() for line in f if line.strip()]
-    else:
-        raise SystemExit(f"No API keys found. Create {KEYS_FILE} or set GEMINI_API_KEYS.")
+    keys = [k.strip() for k in API_KEYS if k.strip() and "key1" not in k and "key2" not in k and "key3" not in k]
     if not keys:
-        raise SystemExit("Key list is empty.")
+        raise SystemExit("No valid API keys. Replace the placeholders in API_KEYS with your Gemini keys.")
+    keys = list(dict.fromkeys(keys))
     print(f"Loaded {len(keys)} API key(s).")
-    return list(dict.fromkeys(keys))
+    return keys
 
 
 # ---------------- TRANSLATION ----------------
 def translate_item(pool, item):
-    import json
     payload = json.dumps(
         {"question": item[QUESTION_COL], "answer": item[ANSWER_COL]},
         ensure_ascii=False,
@@ -152,7 +147,7 @@ def translate_item(pool, item):
 
 # ---------------- DATA & RESUME ----------------
 def load_csv_rows():
-    if not os.path.exists(CSV_FILE):
+    if not CSV_FILE.exists():
         raise SystemExit(f"CSV not found: {CSV_FILE}")
     with open(CSV_FILE, encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
@@ -164,7 +159,7 @@ def load_csv_rows():
 
 def load_done_ids():
     done = set()
-    if os.path.exists(OUTPUT_FILE):
+    if OUTPUT_FILE.exists():
         with open(OUTPUT_FILE, encoding="utf-8-sig", newline="") as f:
             for row in csv.DictReader(f):
                 try:
@@ -175,7 +170,7 @@ def load_done_ids():
 
 
 def ensure_output_header():
-    if not os.path.exists(OUTPUT_FILE) or os.path.getsize(OUTPUT_FILE) == 0:
+    if not OUTPUT_FILE.exists() or OUTPUT_FILE.stat().st_size == 0:
         with open(OUTPUT_FILE, "w", encoding="utf-8-sig", newline="") as f:
             csv.writer(f).writerow(OUTPUT_COLUMNS)
 
